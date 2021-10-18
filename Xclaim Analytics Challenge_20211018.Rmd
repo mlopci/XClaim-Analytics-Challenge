@@ -1,0 +1,197 @@
+---
+title: "XClaim Analyics Challenge_20211012"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,error=FALSE,warning=FALSE,message=FALSE)
+
+#library
+library(ggplot2)
+library(lubridate)
+library(dplyr)
+library(sqldf)
+library(tidyverse)
+library(scales)
+library(stargazer)
+```
+
+```{r}
+#load data
+events_data <- read.csv("https://raw.githubusercontent.com/XclaimInc/analytics_challenge/main/negotiation_events.csv")
+negotiations_data <- read.csv("https://raw.githubusercontent.com/XclaimInc/analytics_challenge/main/negotiations.csv")
+```
+
+```{r}
+#clean negotiations data
+negotiations_data$id_clean <- as.numeric(gsub("[^0-9.-]", "",negotiations_data$id))
+negotiations_data$claims_clean <- as.numeric(gsub("[^0-9.-]", "",negotiations_data$claims))
+negotiations_data$created_at_datetime <- as_datetime(negotiations_data$created_at)
+
+#note that there are several records with poor information (13)
+
+#clean events data
+events_data$created_at_datetime <- as_datetime(events_data$created_at)
+```
+
+```{r}
+#create analysis table where claims is the key var
+analysis_table1 <- sqldf("select distinct b.claims_clean, b.id_clean, b.created_at_datetime as first_datetime
+                        , b.buyer_entity_id,a.* 
+                         from events_data A
+                         left join negotiations_data B on a.negotiation_id = b.id_clean
+                         order by 1,10")
+
+#add month_yr to analysis table
+analysis_table1$month_yr <- format(as.Date(analysis_table1$created_at_datetime), "%Y-%m")
+```
+
+# Number of Unique Buyers with Offers per Month
+
+```{r}
+#add month yr to individual table
+negotiations_data$month_yr <- format(as.Date(negotiations_data$created_at_datetime), "%Y-%m")
+
+#count of buyers with first offers per month-yr
+dates_buyers_first <- sqldf("select month_yr, count(distinct buyer_entity_id) as ct from negotiations_data where month_yr is not NULL group by 1")
+
+#create plot
+buyers_over_time_plot <- ggplot(data=dates_buyers_first, mapping = aes(x=month_yr)) +
+                          geom_col(mapping=aes(y=ct),alpha=0.75,fill="darkgreen") +
+                          geom_smooth(method=lm,mapping=aes(y=ct,group=1),se=FALSE,color="red",linetype="dashed") +
+                          #add text
+                          geom_text(aes(y=ct,label=paste(ct),vjust=-.25)) +
+                          #plot options
+                          theme(axis.text.x = element_text(angle = 30)) +
+                          labs(title = "Number of Unique Buyers with Offers per Month", y="Count",x="Year-Month") +
+                          scale_y_continuous(breaks = seq(0, 10, by = 2))
+
+buyers_over_time_plot
+```
+
+# Number of Unique Claims with Offers per Month
+
+```{r fig.width=12}
+# number of unique claims with offer per month
+#get min/max dates
+min_date <- min(as.Date(analysis_table1$created_at_datetime))
+max_date <- max(as.Date(analysis_table1$created_at_datetime))
+
+#create dateshell
+date_shell <- data.frame("Date"=seq.Date(min_date,max_date,by="month"))
+#add month-yr
+date_shell$Month_Yr <- format(as.Date(date_shell$Date), "%Y-%m")
+
+#count number of claims and claims with offers
+dates_claims <- sqldf("select distinct a.*, count(distinct b.claims_clean) as claims_ct
+                      ,count(distinct case when b.action == 'offer' then b.claims_clean end) as offers_ct
+                      from date_shell A
+                      left join analysis_table1 B on a.month_yr = b.Month_Yr
+                      group by a.date, a.Month_Yr")
+
+#add offer percentage
+dates_claims$offer_perc <- dates_claims$offers_ct/dates_claims$claims_ct
+
+#create plot
+claims_over_time_plot <- ggplot(data=dates_claims, mapping = aes(x=Month_Yr)) +
+                          #columns
+                          geom_col(mapping=aes(y=claims_ct,fill="red"),alpha=0.75) +
+                          geom_col(mapping=aes(y=offers_ct,fill="green"),alpha=0.5) +
+                          #trendlines
+                          geom_smooth(method=lm,mapping=aes(y=claims_ct,group=1),se=FALSE,color="darkred",linetype="dashed") +
+                          geom_smooth(method=lm,mapping=aes(y=offers_ct,group=1),se=FALSE,color="darkgreen",linetype="dashed") +
+                          #add text
+                          geom_text(aes(y=offers_ct,label=paste(percent(offer_perc,accuracy = 0.1)),vjust=-.5)) +
+                          #plot options
+                          theme(axis.text.x = element_text(angle = 30),legend.position = c(0.2, 0.8),legend.key=element_blank()) +
+                          labs(title = "Number of Unique Claims and Unique Claims with Offers per Month", y="Count",x="Year-Month") +
+                          scale_y_continuous(breaks = seq(0, 14000, by = 2000)) + 
+                          scale_fill_manual(name = "Claim Type", values = c("green","red"),labels=c("Total Claims","Claims with Offers"),guide = "legend")
+
+claims_over_time_plot
+```
+
+# Percent of Total Negotiations with Seller Actions
+
+```{r}
+#percent of total negotiations with seller actions
+#seller action will be classified as any offer/accept/decline action made by a different entity than the buying entity
+
+#add seller flag
+analysis_table2 <- sqldf("select distinct *, case when legal_entity_id <> buyer_entity_id and action in ('offer','accept','decline') then 1 else 0 end as seller_flag
+                         from analysis_table1
+                         order by negotiation_id, id")
+
+#determine percent of total negotiations with at least one seller action
+perc_seller_action <- sqldf("select count(distinct negotiation_id) as distinct_negotiations, count(distinct case when seller_flag = 1 then negotiation_id end) as nego_w_selling_act from analysis_table2")
+
+#add percent
+perc_seller_action$selling_act_percent <- perc_seller_action$nego_w_selling_act/perc_seller_action$distinct_negotiations
+
+#print result
+print(perc_seller_action)
+```
+
+# Evaluating Number of Buyers with offers on seller conversion
+
+```{r, results='asis', fig.width=12}
+#does having an offer from more than one buyer change seller conversion?
+#create regression table
+claims_data1 <- sqldf("select distinct claims_clean as claims, count(distinct buyer_entity_id) as number_of_buyers
+                      ,max(seller_flag) as seller_flag
+                      from analysis_table2
+                      where claims_clean is not null
+                      group by claims_clean")
+
+#add general flag for number of buyers
+claims_data1$more_than_one_buyer <- ifelse(claims_data1$number_of_buyers>1,1,0)
+
+#run general logistic regression
+log_model1 <- glm(seller_flag ~ more_than_one_buyer, data = claims_data1, family = "binomial")
+#summary(log_model1)
+
+#run general logistic regression with number of buyers
+log_model2 <- glm(seller_flag ~ number_of_buyers, data = claims_data1, family = "binomial")
+#summary(log_model2)
+
+#set as factor
+claims_data1$number_of_buyers <- as.factor(claims_data1$number_of_buyers)
+
+#run general logistic regression with factor number of buyers
+log_model3 <- glm(seller_flag ~ number_of_buyers, data = claims_data1, family = "binomial")
+#summary(log_model3)
+
+#create function converting logit coefficients to a probability
+logit2prob <- function(logit){
+  odds <- exp(logit)
+  prob <- odds / (1 + odds)
+  return(prob)
+}
+
+#set lit of probabilities
+se_list <-list(logit2prob(coef(log_model1)),logit2prob(coef(log_model2)),logit2prob(coef(log_model3)))
+
+#print pretty output
+stargazer(log_model1,log_model2,log_model3,se=se_list,type = 'html',title="Regression Results",align=TRUE,dep.var.labels=c("Seller Conversion"),covariate.labels=c("More than one Buyer?","Number of Buyers","2 Buyers", "3 Buyers", "4 Buyers", "5 Buyers"),single.row=TRUE)
+
+```
+
+```{r}
+#evaluate buyers 
+offers_by_buyers <- sqldf("select distinct buyer_entity_id, count(distinct id_clean) as ct from negotiations_data group by buyer_entity_id")
+#top 5 buyers make up 30,791 of initial offers (nearly 95% of all initial offers)
+
+actions_by_sellers <- sqldf("select distinct legal_entity_id, count(distinct id) as ct from analysis_table2 where legal_entity_id <> buyer_entity_id and seller_flag =1 group by legal_entity_id")
+#vast majority of sellers make very few actions - indicates that buyers should be focused rather than sellers
+
+#How can you explain the rate (uneven) of negotiation events?
+action_cts <- sqldf("select distinct seller_flag,action, count(*) as ct from analysis_table2 group by 1,2")
+#vast majority of actions are offers/cancellations/retractions, which indicates that buyers are the majority player. the uneven rate of negotiation events is likely to do with the low #conversion rate of sellers. additional info such as the cents per dollar per offer could better describe differences between claims that have seller conversion and those that do not
+```
+
+
+
+# Appendix: All code for this report
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+```
